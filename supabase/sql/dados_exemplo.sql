@@ -14,23 +14,24 @@
 -- para o painel mostrar posições recentes. Rode de novo para "atualizar" o exemplo.
 --
 -- Recusa rodar se já houver dados reais (veículos sem a marca "_exemplo").
+-- Só mexe em tabelas do schema torre (rodar depois do passo 01).
 -- =============================================================================
 
 begin;
 
 do $$
 begin
-  if exists (select 1 from public.veiculos_atual where not (bruto ? '_exemplo')) then
+  if exists (select 1 from torre.veiculos_atual where not (bruto ? '_exemplo')) then
     raise exception 'Já existem dados reais do Atlas: os dados de exemplo não foram carregados.';
   end if;
 end $$;
 
 -- Tira o exemplo anterior, se houver, para recarregar do zero.
-delete from public.posicoes where placa in (select placa from public.veiculos_atual where bruto ? '_exemplo');
-delete from public.paradas_atual where placa in (select placa from public.veiculos_atual where bruto ? '_exemplo');
-delete from public.veiculos_atual where bruto ? '_exemplo';
+delete from torre.posicoes where placa in (select placa from torre.veiculos_atual where bruto ? '_exemplo');
+delete from torre.paradas_atual where placa in (select placa from torre.veiculos_atual where bruto ? '_exemplo');
+delete from torre.veiculos_atual where bruto ? '_exemplo';
 
-select public.aplicar_atlas($amostra$
+select torre.aplicar_atlas($amostra$
 [
  {
   "_exemplo": true,
@@ -1932,7 +1933,7 @@ select public.aplicar_atlas($amostra$
 $amostra$::jsonb);
 
 -- Desloca as datas para o "agora" real.
-update public.veiculos_atual
+update torre.veiculos_atual
    set data_cadastro_sm     = data_cadastro_sm     + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        data_ultima_posicao  = data_ultima_posicao  + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        origem_eta_original  = origem_eta_original  + (now() - '2026-10-28 12:00:00-03'::timestamptz),
@@ -1952,30 +1953,30 @@ update public.veiculos_atual
        inicio_real          = inicio_real          + (now() - '2026-10-28 12:00:00-03'::timestamptz)
  where bruto ? '_exemplo';
 
-update public.paradas_atual
+update torre.paradas_atual
    set eta_original = eta_original + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        eta_real     = eta_real     + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        entrada      = entrada      + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        saida        = saida        + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        entrada_real = entrada_real + (now() - '2026-10-28 12:00:00-03'::timestamptz),
        saida_real   = saida_real   + (now() - '2026-10-28 12:00:00-03'::timestamptz)
- where placa in (select placa from public.veiculos_atual where bruto ? '_exemplo');
+ where placa in (select placa from torre.veiculos_atual where bruto ? '_exemplo');
 
 -- Histórico: refaz com as datas já deslocadas.
-delete from public.posicoes where placa in (select placa from public.veiculos_atual where bruto ? '_exemplo');
-insert into public.posicoes (placa, latitude, longitude, velocidade, macro, data_posicao)
+delete from torre.posicoes where placa in (select placa from torre.veiculos_atual where bruto ? '_exemplo');
+insert into torre.posicoes (placa, latitude, longitude, velocidade, macro, data_posicao)
 select placa, latitude, longitude, velocidade, macro_vigente, data_ultima_posicao
-  from public.veiculos_atual
+  from torre.veiculos_atual
  where bruto ? '_exemplo' and latitude is not null and data_ultima_posicao is not null
 on conflict do nothing;
 
 -- Marca o registro de sincronização como exemplo.
-update public.sincronizacao
+update torre.sincronizacao
    set fonte = 'exemplo'
- where id = (select max(id) from public.sincronizacao);
+ where id = (select max(id) from torre.sincronizacao);
 
 commit;
 
 -- Conferir (esperado: 29 veículos ativos; 1 item sem placa e sem SM foi ignorado):
---   select count(*) as veiculos, count(*) filter (where posicao_atrasada) as atrasados from public.v_painel;
---   select id, fonte, recebidos, gravados, sem_placa, erro from public.sincronizacao order by id desc limit 1;
+--   select count(*) as veiculos, count(*) filter (where posicao_atrasada) as atrasados from torre.v_painel;
+--   select id, fonte, recebidos, gravados, sem_placa, erro from torre.sincronizacao order by id desc limit 1;

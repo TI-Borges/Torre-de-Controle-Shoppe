@@ -1,8 +1,13 @@
 /**
  * ==========================================================================
  * AJBorges Transportes - Torre de Controle Shopee
- * Tela de login (e-mail e senha do Supabase Auth)
+ * Tela de login (e-mail e senha do Supabase Auth do site)
  * ==========================================================================
+ *
+ * As contas são as do Supabase do site: o admin do site entra com o mesmo
+ * e-mail e senha da aba "Administrador" do login do site. Quem não tem acesso
+ * vê "Sem acesso à Torre de Controle" e a sessão é encerrada aqui (sem
+ * redirecionar para o site).
  */
 
 (function () {
@@ -12,8 +17,9 @@
     const mensagem = document.getElementById('login-mensagem');
 
     const MENSAGENS = {
-        'sem-acesso': 'Seu usuário não tem acesso ao painel. Fale com a gestão.',
+        'sem-acesso': 'Sem acesso à Torre de Controle.',
         'sem-config': 'Painel sem configuração: preencha a URL e a chave pública em JavaScript/supabase-client.js.',
+        'sem-schema': 'A Torre ainda não está liberada na API do Supabase (Data API → Exposed schemas → torre).',
         'erro': 'Não foi possível conferir seu acesso. Tente de novo.',
         'saiu': 'Você saiu do painel.'
     };
@@ -63,7 +69,7 @@
             }
             const r = await app.obterOperador();
             if (!r.operador) {
-                await app.supabase.auth.signOut();
+                await app.sair();
                 mostrar(MENSAGENS[r.motivo] || MENSAGENS.erro);
                 return;
             }

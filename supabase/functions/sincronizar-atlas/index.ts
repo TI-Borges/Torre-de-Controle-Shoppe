@@ -2,15 +2,20 @@
 // Torre de Controle Shopee - Edge Function "sincronizar-atlas"
 // =============================================================================
 // Chamada pelo pg_cron (passo 02) a cada 15 min. Busca todos os veículos ativos
-// na API do Atlas, tira o CPF e entrega para a RPC aplicar_atlas (passo 01).
+// na API do Atlas, tira o CPF e entrega para a RPC torre.aplicar_atlas (passo 01).
 //
+// Roda no Supabase do SITE. Os secrets do site (CRON_SECRET, ALLOWED_ORIGINS)
+// não são lidos nem alterados: a Torre usa nomes próprios.
 // Secrets (Edge Functions > Secrets; nenhum valor fica no código):
-//   ATLAS_TOKEN   token do Atlas (vai no "Authorization: Bearer ...")
-//   ATLAS_CONTA   valor do cabeçalho X-AJBORGES-AUTH
-//   CRON_SECRET   segredo que o agendamento manda no cabeçalho x-cron-secret
+//   ATLAS_TOKEN         token do Atlas (vai no "Authorization: Bearer ...")
+//   ATLAS_CONTA         valor do cabeçalho X-AJBORGES-AUTH
+//   TORRE_CRON_SECRET   segredo que o agendamento manda no cabeçalho x-cron-secret
 // Variáveis padrão do Supabase (já existem em toda função):
 //   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 // Opcional: ATLAS_URL (troca o endereço da API sem mexer no código).
+//
+// As RPCs ficam no schema "torre": as chamadas REST vão com Content-Profile e
+// Accept-Profile = torre (o schema precisa estar em Data API → Exposed schemas).
 //
 // Publicar com "Verify JWT" DESLIGADO: quem protege é o x-cron-secret.
 // Logs: só contagens, status HTTP e request id. Nunca nome ou CPF.
@@ -151,6 +156,9 @@ async function chamarRpc(deps: Dependencias, nome: string, corpo: unknown): Prom
     apikey: chave,
     'Content-Type': 'application/json',
     Accept: 'application/json',
+    // RPCs no schema torre (sem isso o PostgREST procura no public)
+    'Content-Profile': 'torre',
+    'Accept-Profile': 'torre',
   };
   // Chave antiga (JWT) também vai no Authorization; a nova (sb_secret_...) só no apikey.
   if (chave.startsWith('eyJ')) headers.Authorization = `Bearer ${chave}`;
@@ -185,9 +193,9 @@ export function criarHandler(deps: Dependencias) {
       return json({ ok: false, erro: 'use POST', request_id: requestId }, 405);
     }
 
-    const segredo = deps.env('CRON_SECRET') ?? '';
+    const segredo = deps.env('TORRE_CRON_SECRET') ?? '';
     if (!segredo) {
-      log({ request_id: requestId, etapa: 'config', erro: 'CRON_SECRET não configurado' });
+      log({ request_id: requestId, etapa: 'config', erro: 'TORRE_CRON_SECRET não configurado' });
       return json({ ok: false, erro: 'função sem configuração', request_id: requestId }, 500);
     }
     if (!(await segredoConfere(req.headers.get('x-cron-secret') ?? '', segredo))) {

@@ -10,7 +10,8 @@ const ATLAS = 'https://externalnewconnect.atlasgr.com.br/travel/api/all-vehicles
 const SEGREDO = 'segredo-de-teste-123';
 
 const ENV_PADRAO = {
-  CRON_SECRET: SEGREDO,
+  TORRE_CRON_SECRET: SEGREDO,
+  CRON_SECRET: 'segredo-do-site', // secret do site: a função da Torre não pode aceitar
   ATLAS_TOKEN: 'token-de-teste',
   ATLAS_CONTA: 'conta-de-teste',
   SUPABASE_URL,
@@ -25,7 +26,7 @@ const db = await criarBanco();
 
 // Monta o ambiente: respostas do Atlas em sequência, RPCs no PGlite.
 async function montar({ atlas, env = {}, rpcFalha = false } = {}) {
-  await db.exec(`truncate public.veiculos_atual, public.paradas_atual, public.posicoes, public.sincronizacao`);
+  await db.exec(`truncate torre.veiculos_atual, torre.paradas_atual, torre.posicoes, torre.sincronizacao`);
   const chamadas = { atlas: [], rpc: [] };
   const logs = [];
   const respostasAtlas = [...atlas];
@@ -50,14 +51,18 @@ async function montar({ atlas, env = {}, rpcFalha = false } = {}) {
     if (m) {
       const corpo = JSON.parse(init.body);
       chamadas.rpc.push({ nome: m[1], corpo, headers: init.headers, texto: init.body });
+      // como o PostgREST: sem os cabeçalhos do schema torre, procura no public e não acha
+      if (init.headers['Content-Profile'] !== 'torre' || init.headers['Accept-Profile'] !== 'torre') {
+        return new Response('{"code":"PGRST202","message":"função não encontrada no schema public"}', { status: 404 });
+      }
       if (rpcFalha && m[1] === 'aplicar_atlas') return new Response('{"message":"erro"}', { status: 500 });
       if (m[1] === 'aplicar_atlas') {
-        const r = await db.query(`select public.aplicar_atlas($1::jsonb, $2, $3::timestamptz) as r`,
+        const r = await db.query(`select torre.aplicar_atlas($1::jsonb, $2, $3::timestamptz) as r`,
           [JSON.stringify(corpo.p_itens), corpo.p_http_status, corpo.p_iniciado_em]);
         return new Response(JSON.stringify(r.rows[0].r), { status: 200 });
       }
       if (m[1] === 'registrar_falha_atlas') {
-        const r = await db.query(`select public.registrar_falha_atlas($1, $2, $3::timestamptz) as id`,
+        const r = await db.query(`select torre.registrar_falha_atlas($1, $2, $3::timestamptz) as id`,
           [corpo.p_http_status, corpo.p_erro, corpo.p_iniciado_em]);
         return new Response(JSON.stringify(r.rows[0].id), { status: 200 });
       }
@@ -77,7 +82,7 @@ async function montar({ atlas, env = {}, rpcFalha = false } = {}) {
     const resp = await handler(new Request('http://local/sincronizar-atlas', { method, headers }));
     return { status: resp.status, corpo: await resp.json() };
   };
-  const ultimaSinc = async () => (await db.query(`select * from public.sincronizacao order by id desc limit 1`)).rows[0];
+  const ultimaSinc = async () => (await db.query(`select * from torre.sincronizacao order by id desc limit 1`)).rows[0];
   return { db, chamadas, logs, chamar, ultimaSinc };
 }
 
@@ -88,6 +93,8 @@ test('sem o x-cron-secret certo: 401 e não chama o Atlas', async () => {
   assert.equal((await t.chamar({})).status, 401);
   assert.equal((await t.chamar({ 'x-cron-secret': 'errado' })).status, 401);
   assert.equal((await t.chamar({ 'x-cron-secret': SEGREDO + 'x' })).status, 401);
+  // o CRON_SECRET do site não abre a função da Torre
+  assert.equal((await t.chamar({ 'x-cron-secret': 'segredo-do-site' })).status, 401);
   assert.equal((await t.chamar({ 'x-cron-secret': SEGREDO }, 'GET')).status, 405);
   assert.equal(t.chamadas.atlas.length, 0);
 });
@@ -110,6 +117,8 @@ test('200 normal: grava a amostra, cabeçalhos certos e nenhum CPF chega à RPC'
   const rpc = t.chamadas.rpc.find((c) => c.nome === 'aplicar_atlas');
   assert.equal(rpc.headers.apikey, 'eyJ-chave-de-teste');
   assert.equal(rpc.headers.Authorization, 'Bearer eyJ-chave-de-teste');
+  assert.equal(rpc.headers['Content-Profile'], 'torre');
+  assert.equal(rpc.headers['Accept-Profile'], 'torre');
   assert.doesNotMatch(rpc.texto, /cpf/i, 'chave cpf chegou à RPC');
   assert.doesNotMatch(rpc.texto, /\d{3}\.\d{3}\.\d{3}-\d{2}/, 'número de CPF chegou à RPC');
   assert.equal(rpc.corpo.p_itens[0].motoristas[0].nome, 'Motorista Exemplo 01');
@@ -152,7 +161,7 @@ test('array vazio: chama aplicar_atlas e a trava não deixa apagar nada', async 
   assert.equal(r.status, 409);
   assert.equal(r.corpo.ok, false);
   assert.match(r.corpo.erro, /^trava/);
-  const ativos = (await t.db.query(`select count(*)::int as n from public.veiculos_atual where ativo`)).rows[0].n;
+  const ativos = (await t.db.query(`select count(*)::int as n from torre.veiculos_atual where ativo`)).rows[0].n;
   assert.equal(ativos, 29);
 });
 
@@ -209,7 +218,7 @@ test('secrets faltando: 500 com os nomes (nunca os valores)', async () => {
   assert.match(r.corpo.erro, /ATLAS_TOKEN, ATLAS_CONTA/);
   assert.equal(t.chamadas.atlas.length, 0);
 
-  const sem = await montar({ atlas: [], env: { CRON_SECRET: '' } });
+  const sem = await montar({ atlas: [], env: { TORRE_CRON_SECRET: '' } });
   assert.equal((await sem.chamar({ 'x-cron-secret': '' })).status, 500);
 });
 

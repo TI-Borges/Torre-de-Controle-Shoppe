@@ -4,12 +4,15 @@
  * Cliente Supabase, sessão do operador e utilitários comuns às páginas
  * ==========================================================================
  *
+ * A Torre usa o Supabase DO SITE (mesmo login dos admins do site). Os dados
+ * ficam no schema "torre": toda consulta passa por .schema('torre').
+ *
  * Aqui só entram a URL do projeto e a chave PÚBLICA (anon / publishable).
  * Elas são públicas por natureza: quem protege os dados é o RLS do banco.
  * NUNCA coloque aqui a service role / secret key.
  */
 
-// 1. Projeto Supabase da Torre de Controle (Project Settings > API)
+// 1. Projeto Supabase do site (Project Settings > API)
 const TORRE_SUPABASE = window.TORRE_CONFIG || {
     url: 'https://SEU-PROJETO.supabase.co',
     anonKey: 'COLE_AQUI_A_CHAVE_PUBLICA'
@@ -79,8 +82,21 @@ aplicarTema(lerPreferencia('torre.tema', null));
 // 4. Sessão do operador
 
 /**
- * Devolve { usuario, operador } se houver sessão e o usuário for operador ativo.
- * Caso contrário devolve { motivo }: 'sem-config', 'sem-sessao', 'sem-acesso' ou 'erro'.
+ * Sai só NESTE navegador (scope 'local'). O padrão do supabase-js ('global')
+ * derrubaria a sessão da pessoa no site também, em todos os aparelhos (ex.: um
+ * motorista que digitou a senha aqui por engano).
+ */
+async function sair() {
+    if (!torreSupabase) return;
+    try { await torreSupabase.auth.signOut({ scope: 'local' }); } catch (e) { /* segue */ }
+}
+
+/**
+ * Devolve { usuario, operador } se houver sessão e o usuário puder ver a Torre:
+ * admin do site (claim app_metadata.role) ou operador ativo em torre.operadores.
+ * Quem decide é o banco (torre.eh_operador()), o mesmo teste do RLS.
+ * Caso contrário devolve { motivo }: 'sem-config', 'sem-sessao', 'sem-acesso',
+ * 'sem-schema' ou 'erro'.
  */
 async function obterOperador() {
     if (!torreSupabase) return { motivo: 'sem-config' };
@@ -89,23 +105,33 @@ async function obterOperador() {
     const usuario = sessao && sessao.session ? sessao.session.user : null;
     if (!usuario) return { motivo: 'sem-sessao' };
 
-    const { data, error } = await torreSupabase
-        .from('operadores')
-        .select('nome, papel, ativo')
-        .eq('user_id', usuario.id)
-        .maybeSingle();
+    const [acesso, cadastro] = await Promise.all([
+        torreSupabase.schema('torre').rpc('eh_operador'),
+        torreSupabase.schema('torre')
+            .from('operadores')
+            .select('nome, papel, ativo')
+            .eq('user_id', usuario.id)
+            .maybeSingle()
+    ]);
 
-    if (error) return { motivo: 'erro' };
-    if (!data || !data.ativo) return { motivo: 'sem-acesso' };
-    return { usuario, operador: data };
+    // PGRST106: o schema torre não está em Data API → Exposed schemas.
+    if (acesso.error) return { motivo: acesso.error.code === 'PGRST106' ? 'sem-schema' : 'erro' };
+    if (acesso.data !== true) return { motivo: 'sem-acesso' };
+
+    // Admin do site sem cadastro em torre.operadores: nome do Auth ou o e-mail.
+    const meta = usuario.user_metadata || {};
+    const operador = cadastro.data && cadastro.data.ativo
+        ? cadastro.data
+        : { nome: meta.nome || usuario.email || 'Administrador', papel: 'admin', ativo: true };
+    return { usuario, operador };
 }
 
-/** Para as páginas internas: sem sessão ou sem ser operador, volta para o login. */
+/** Para as páginas internas: sem sessão ou sem acesso, volta para o login da Torre. */
 async function exigirOperador() {
     const r = await obterOperador();
     if (r.operador) return r;
 
-    if (r.motivo === 'sem-acesso' && torreSupabase) await torreSupabase.auth.signOut();
+    if (r.motivo === 'sem-acesso') await sair();
     const motivo = r.motivo === 'sem-sessao' ? '' : '?motivo=' + encodeURIComponent(r.motivo);
     window.location.replace('login.html' + motivo);
     return new Promise(() => {}); // a página para aqui até o redirecionamento
@@ -120,5 +146,6 @@ window.TorreApp = {
     aplicarTema,
     temaEfetivo,
     obterOperador,
-    exigirOperador
+    exigirOperador,
+    sair
 };

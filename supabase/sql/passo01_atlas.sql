@@ -1,20 +1,28 @@
 -- =============================================================================
 -- Torre de Controle Shopee - Passo 01: tabelas do Atlas, RPC, painel e acesso
 -- =============================================================================
--- Rodar no SQL Editor do Supabase (projeto da Torre de Controle, NÃO o do site).
+-- Rodar no SQL Editor do Supabase DO SITE (o mesmo login dos admins do site).
 -- Pode ser rodado de novo: usa "if not exists" / "create or replace".
 --
--- O que este passo cria:
+-- O banco do site está em produção. Por isso TUDO da Torre fica no schema
+-- "torre": nada é criado, alterado ou apagado no public, e nenhum grant/revoke
+-- é feito fora do torre. Do site, só se CHAMA a função public.is_admin().
+--
+-- O que este passo cria (tudo em torre.):
 --   parametros         limites configuráveis (minutos de atraso, dias de histórico)
 --   veiculos_atual     retrato atual: uma linha por veículo (chave = placa do cavalo)
 --   paradas_atual      paradas das viagens atuais (substituída a cada sincronização)
 --   posicoes           histórico de posições (só entra quando a data da posição muda)
 --   sincronizacao      registro de cada chamada ao Atlas (contagens e erro)
---   operadores         quem pode ver o painel (user_id do Supabase Auth)
+--   operadores         quem vê a Torre sem ser admin do site (ex.: analista de frota)
+--   eh_operador()      admin do site (public.is_admin()) OU operador ativo
 --   aplicar_atlas()    grava a resposta do Atlas numa transação (só service_role)
 --   registrar_falha_atlas()  registra falha de HTTP/JSON (só service_role)
 --   limpar_historico() apaga posições com mais de N dias (agendada no passo 02)
 --   v_painel           o que o painel lê, com a regra do ETA de destino
+--
+-- ANTES de usar pelo painel: Project Settings → Data API → Exposed schemas →
+-- adicionar "torre" (sem isso a API REST não enxerga o schema).
 --
 -- Nada aqui depende da conta ou do endereço do projeto: não há URL nem chave.
 -- O CPF do motorista nunca é gravado (nem nas colunas, nem no "bruto").
@@ -22,15 +30,39 @@
 
 
 -- -----------------------------------------------------------------------------
+-- 0. Schema próprio da Torre
+-- -----------------------------------------------------------------------------
+-- Logado (authenticated) e a Edge Function (service_role) usam o schema; o
+-- visitante sem login (anon) nem enxerga. Quem lê o quê ainda é decidido pelos
+-- grants e pelo RLS das seções 9 e 10.
+create schema if not exists torre;
+
+revoke all on schema torre from public, anon;
+grant usage on schema torre to authenticated, service_role;
+
+-- Objetos criados no futuro dentro do torre NÃO ficam abertos: só o service_role
+-- recebe acesso automático. (Funções: o Postgres dá EXECUTE a PUBLIC para toda
+-- função nova, em qualquer schema, e isso não dá para tirar só no torre sem mexer
+-- no padrão global do banco do site; por isso a seção 9 tira o EXECUTE de todas as
+-- funções do torre de uma vez, e toda função nova precisa rodar este passo de novo
+-- ou ter o seu próprio revoke.)
+alter default privileges in schema torre revoke all on tables    from public, anon, authenticated;
+alter default privileges in schema torre revoke all on sequences from public, anon, authenticated;
+alter default privileges in schema torre revoke all on functions from public, anon, authenticated;
+alter default privileges in schema torre grant all on tables    to service_role;
+alter default privileges in schema torre grant all on sequences to service_role;
+
+
+-- -----------------------------------------------------------------------------
 -- 1. Parâmetros (valores que a gestão pode trocar sem mudar código)
 -- -----------------------------------------------------------------------------
-create table if not exists public.parametros (
+create table if not exists torre.parametros (
   chave     text primary key,
   valor     text not null,
   descricao text
 );
 
-insert into public.parametros (chave, valor, descricao) values
+insert into torre.parametros (chave, valor, descricao) values
   ('minutos_posicao_atrasada', '30', 'Posição mais velha que isso aparece como desatualizada no painel'),
   ('minutos_sincronizacao_atrasada', '35', 'Sem sincronização boa há mais que isso: o "Atualizado às" fica vermelho'),
   ('dias_historico_posicoes', '15', 'Posições mais velhas que isso são apagadas pela limpeza diária'),
@@ -38,7 +70,7 @@ insert into public.parametros (chave, valor, descricao) values
 on conflict (chave) do nothing;
 
 -- Lê um parâmetro numérico; se faltar ou estiver inválido, usa o padrão.
-create or replace function public.parametro_int(p_chave text, p_padrao integer)
+create or replace function torre.parametro_int(p_chave text, p_padrao integer)
 returns integer
 language sql
 stable
@@ -47,7 +79,7 @@ set search_path = ''
 as $$
   select coalesce(
     (select case when btrim(valor) ~ '^\d+$' then btrim(valor)::integer end
-       from public.parametros where chave = p_chave),
+       from torre.parametros where chave = p_chave),
     p_padrao);
 $$;
 
@@ -59,7 +91,7 @@ $$;
 -- Data/hora: aceita ISO (com ou sem fuso), "dd/mm/aaaa hh:mm[:ss]", "dd/mm/aaaa"
 -- e epoch em milissegundos. Sem fuso explícito = horário de America/Sao_Paulo.
 -- Valor vazio, "-", "0" ou inválido (ex.: 31/02) vira null, sem erro.
-create or replace function public.atlas_data(p_valor text)
+create or replace function torre.atlas_data(p_valor text)
 returns timestamptz
 language plpgsql
 stable
@@ -104,7 +136,7 @@ end;
 $$;
 
 -- Número: aceita 12.5, "12,5" e "1.234,5". Vazio ou inválido vira null.
-create or replace function public.atlas_numero(p_valor text)
+create or replace function torre.atlas_numero(p_valor text)
 returns numeric
 language plpgsql
 immutable
@@ -129,7 +161,7 @@ end;
 $$;
 
 -- Texto: tira espaços das pontas; vazio vira null.
-create or replace function public.atlas_texto(p_valor text)
+create or replace function torre.atlas_texto(p_valor text)
 returns text
 language sql
 immutable
@@ -139,7 +171,7 @@ as $$
 $$;
 
 -- SM: 0, vazio, "-" ou null = sem SM (devolve null).
-create or replace function public.atlas_sm(p_valor text)
+create or replace function torre.atlas_sm(p_valor text)
 returns text
 language sql
 immutable
@@ -153,7 +185,7 @@ as $$
 $$;
 
 -- Placa: maiúscula, só letras e números (sem traço/espaço).
-create or replace function public.atlas_placa(p_valor text)
+create or replace function torre.atlas_placa(p_valor text)
 returns text
 language sql
 immutable
@@ -163,7 +195,7 @@ as $$
 $$;
 
 -- Lista: array fica como está; objeto vira [objeto]; o resto vira [].
-create or replace function public.atlas_lista(p_valor jsonb)
+create or replace function torre.atlas_lista(p_valor jsonb)
 returns jsonb
 language sql
 immutable
@@ -178,7 +210,7 @@ $$;
 
 -- Remove o CPF de qualquer lugar do item: chaves com "cpf" no nome (em qualquer
 -- nível) e textos no formato 000.000.000-00.
-create or replace function public.atlas_sem_cpf(p_valor jsonb)
+create or replace function torre.atlas_sem_cpf(p_valor jsonb)
 returns jsonb
 language plpgsql
 immutable
@@ -188,13 +220,13 @@ begin
   case jsonb_typeof(p_valor)
     when 'object' then
       return coalesce(
-        (select jsonb_object_agg(e.k, public.atlas_sem_cpf(e.v))
+        (select jsonb_object_agg(e.k, torre.atlas_sem_cpf(e.v))
            from jsonb_each(p_valor) as e(k, v)
           where position('cpf' in lower(e.k)) = 0),
         '{}'::jsonb);
     when 'array' then
       return coalesce(
-        (select jsonb_agg(public.atlas_sem_cpf(e.v) order by e.n)
+        (select jsonb_agg(torre.atlas_sem_cpf(e.v) order by e.n)
            from jsonb_array_elements(p_valor) with ordinality as e(v, n)),
         '[]'::jsonb);
     when 'string' then
@@ -215,7 +247,7 @@ $$;
 
 -- Retrato atual: uma linha por veículo.
 -- placa = placa do cavalo normalizada; item sem placa e com SM = 'SEMPLACA:<sm>'.
-create table if not exists public.veiculos_atual (
+create table if not exists torre.veiculos_atual (
   placa                 text primary key,
   placa_carreta         text,
   frota_cavalo          text,
@@ -263,10 +295,10 @@ create table if not exists public.veiculos_atual (
   criado_em             timestamptz not null default now()
 );
 
-create index if not exists veiculos_atual_ativo_idx on public.veiculos_atual (ativo);
+create index if not exists veiculos_atual_ativo_idx on torre.veiculos_atual (ativo);
 
 -- Paradas das viagens atuais (apagadas e regravadas a cada sincronização).
-create table if not exists public.paradas_atual (
+create table if not exists torre.paradas_atual (
   id            bigint generated always as identity primary key,
   placa         text not null,
   codigo_sm     text,
@@ -280,11 +312,11 @@ create table if not exists public.paradas_atual (
   saida_real    timestamptz
 );
 
-create index if not exists paradas_atual_placa_idx on public.paradas_atual (placa, sequencia);
+create index if not exists paradas_atual_placa_idx on torre.paradas_atual (placa, sequencia);
 
 -- Histórico de posições. Sem coluna id de propósito: a chave é (placa, data_posicao),
 -- o que já impede gravar a mesma posição duas vezes e economiza espaço.
-create table if not exists public.posicoes (
+create table if not exists torre.posicoes (
   placa         text not null,
   latitude      double precision not null,
   longitude     double precision not null,
@@ -294,12 +326,12 @@ create table if not exists public.posicoes (
   inserido_em   timestamptz not null default now()
 );
 
-create unique index if not exists posicoes_placa_data_idx on public.posicoes (placa, data_posicao desc);
+create unique index if not exists posicoes_placa_data_idx on torre.posicoes (placa, data_posicao desc);
 -- BRIN: índice minúsculo para a limpeza por data (as linhas entram em ordem de tempo).
-create index if not exists posicoes_data_brin_idx on public.posicoes using brin (data_posicao);
+create index if not exists posicoes_data_brin_idx on torre.posicoes using brin (data_posicao);
 
 -- Registro de cada sincronização.
-create table if not exists public.sincronizacao (
+create table if not exists torre.sincronizacao (
   id            bigint generated always as identity primary key,
   fonte         text not null default 'atlas',
   iniciado_em   timestamptz not null default now(),
@@ -312,11 +344,15 @@ create table if not exists public.sincronizacao (
   detalhes      jsonb             -- contagens extras (desativados, posições novas, etc.)
 );
 
-create index if not exists sincronizacao_terminado_idx on public.sincronizacao (terminado_em desc);
+create index if not exists sincronizacao_terminado_idx on torre.sincronizacao (terminado_em desc);
 
--- Quem pode ver o painel.
-create table if not exists public.operadores (
-  user_id    uuid primary key references auth.users (id) on delete cascade,
+-- Quem vê a Torre SEM ser admin do site (o admin do site já entra pela
+-- public.is_admin()). Ex.: analista de frota.
+-- Sem "references auth.users" de propósito: a FK criaria gatilhos internos na
+-- tabela auth.users do site. Cadastre sempre com "select id from auth.users"
+-- (README); se o usuário for apagado no Auth, a linha daqui só fica sem efeito.
+create table if not exists torre.operadores (
+  user_id    uuid primary key,
   nome       text not null,
   papel      text not null default 'operador' check (papel in ('operador', 'gestao')),
   ativo      boolean not null default true,
@@ -327,19 +363,25 @@ create table if not exists public.operadores (
 -- -----------------------------------------------------------------------------
 -- 4. Acesso: eh_operador()
 -- -----------------------------------------------------------------------------
-create or replace function public.eh_operador()
+-- Vê a Torre: admin do site OU operador ativo da Torre.
+-- public.is_admin() é a função do site (security definer, lê
+-- auth.jwt() -> 'app_metadata' ->> 'role' = admin ou diretoria). Aqui ela só é
+-- CHAMADA; nunca alterada. O app_metadata só é gravado pelo servidor (o usuário
+-- não consegue mudar o próprio), ao contrário do user_metadata.
+create or replace function torre.eh_operador()
 returns boolean
 language sql
 stable
 security definer
 set search_path = ''
 as $$
-  select exists (
-    select 1
-      from public.operadores o
-     where o.user_id = (select auth.uid())
-       and o.ativo
-  );
+  select coalesce(public.is_admin(), false)
+      or exists (
+           select 1
+             from torre.operadores o
+            where o.user_id = (select auth.uid())
+              and o.ativo
+         );
 $$;
 
 
@@ -350,7 +392,7 @@ $$;
 -- Trava: se vier vazio ou com menos de 50% dos veículos ativos hoje, NÃO altera
 -- nada e só registra o erro em sincronizacao (como o script da planilha faz).
 -- Linhas de exemplo (bruto com "_exemplo") não contam para a trava.
-create or replace function public.aplicar_atlas(
+create or replace function torre.aplicar_atlas(
   p_itens        jsonb,
   p_http_status  integer default 200,
   p_iniciado_em  timestamptz default null
@@ -373,7 +415,7 @@ declare
   v_desativados  integer := 0;
   v_paradas      integer := 0;
   v_posicoes     integer := 0;
-  v_dias         integer := public.parametro_int('dias_historico_posicoes', 15);
+  v_dias         integer := torre.parametro_int('dias_historico_posicoes', 15);
   v_erro         text;
   v_detalhes     jsonb;
 begin
@@ -381,9 +423,9 @@ begin
   perform pg_advisory_xact_lock(hashtext('torre.aplicar_atlas'));
 
   -- Array, objeto único ou nada; só objetos; sem CPF em lugar nenhum.
-  select coalesce(jsonb_agg(public.atlas_sem_cpf(e.item) order by e.n), '[]'::jsonb)
+  select coalesce(jsonb_agg(torre.atlas_sem_cpf(e.item) order by e.n), '[]'::jsonb)
     into v_itens
-    from jsonb_array_elements(public.atlas_lista(p_itens)) with ordinality as e(item, n)
+    from jsonb_array_elements(torre.atlas_lista(p_itens)) with ordinality as e(item, n)
    where jsonb_typeof(e.item) = 'object';
 
   v_recebidos := jsonb_array_length(v_itens);
@@ -393,9 +435,9 @@ begin
   with base as (
     select e.n,
            e.item,
-           public.atlas_lista(e.item -> 'placas')     as placas,
-           public.atlas_lista(e.item -> 'motoristas') as motoristas,
-           public.atlas_sm(e.item ->> 'codigo_sm')    as sm
+           torre.atlas_lista(e.item -> 'placas')     as placas,
+           torre.atlas_lista(e.item -> 'motoristas') as motoristas,
+           torre.atlas_sm(e.item ->> 'codigo_sm')    as sm
       from jsonb_array_elements(v_itens) with ordinality as e(item, n)
   ),
   comp as (
@@ -414,24 +456,24 @@ begin
   ),
   chaves as (
     select c.*,
-           public.atlas_placa(coalesce(c.cavalo ->> 'placa', c.item ->> 'placa')) as placa_cavalo,
-           public.atlas_numero(c.item ->> 'latitude')  as lat,
-           public.atlas_numero(c.item ->> 'longitude') as lon
+           torre.atlas_placa(coalesce(c.cavalo ->> 'placa', c.item ->> 'placa')) as placa_cavalo,
+           torre.atlas_numero(c.item ->> 'latitude')  as lat,
+           torre.atlas_numero(c.item ->> 'longitude') as lon
       from comp c
   )
   select k.n,
          coalesce(k.placa_cavalo, 'SEMPLACA:' || k.sm) as placa,
          k.placa_cavalo is not null                    as tem_placa,
-         public.atlas_placa(k.carreta ->> 'placa')     as placa_carreta,
-         public.atlas_texto(k.cavalo ->> 'frota')      as frota_cavalo,
-         upper(public.atlas_texto(k.cavalo ->> 'vinculo'))  as vinculo_cavalo,
-         upper(public.atlas_texto(k.carreta ->> 'vinculo')) as vinculo_carreta,
-         public.atlas_texto(k.item ->> 'nome_cliente')       as nome_cliente,
-         public.atlas_texto(k.item ->> 'operacao')           as operacao,
+         torre.atlas_placa(k.carreta ->> 'placa')     as placa_carreta,
+         torre.atlas_texto(k.cavalo ->> 'frota')      as frota_cavalo,
+         upper(torre.atlas_texto(k.cavalo ->> 'vinculo'))  as vinculo_cavalo,
+         upper(torre.atlas_texto(k.carreta ->> 'vinculo')) as vinculo_carreta,
+         torre.atlas_texto(k.item ->> 'nome_cliente')       as nome_cliente,
+         torre.atlas_texto(k.item ->> 'operacao')           as operacao,
          k.sm                                                as codigo_sm,
-         public.atlas_texto(k.item ->> 'status_sm')          as status_sm,
-         public.atlas_texto(k.item ->> 'status_operacional') as status_operacional,
-         public.atlas_data(k.item ->> 'data_cadastro_sm')    as data_cadastro_sm,
+         torre.atlas_texto(k.item ->> 'status_sm')          as status_sm,
+         torre.atlas_texto(k.item ->> 'status_operacional') as status_operacional,
+         torre.atlas_data(k.item ->> 'data_cadastro_sm')    as data_cadastro_sm,
          -- 0,0 ou fora da faixa = sem posição
          case when k.lat between -90 and 90 and k.lon between -180 and 180
                    and not (k.lat = 0 and k.lon = 0)
@@ -439,35 +481,35 @@ begin
          case when k.lat between -90 and 90 and k.lon between -180 and 180
                    and not (k.lat = 0 and k.lon = 0)
               then k.lon::double precision end               as longitude,
-         public.atlas_data(k.item ->> 'data_ultima_posicao') as data_ultima_posicao,
-         public.atlas_numero(k.item ->> 'velocidade')        as velocidade,
-         public.atlas_texto(k.item ->> 'macro_vigente')      as macro_vigente,
-         public.atlas_texto(k.item ->> 'cidade_uf')          as cidade_uf,
-         public.atlas_texto(k.item ->> 'localizacao_atual')  as localizacao_atual,
-         public.atlas_texto(k.motorista ->> 'nome')          as motorista_nome,
-         upper(public.atlas_texto(k.motorista ->> 'vinculo')) as motorista_vinculo,
-         public.atlas_texto(k.item -> 'rota' ->> 'codigo')    as rota_codigo,
-         public.atlas_texto(k.item -> 'rota' ->> 'descricao') as rota_descricao,
-         public.atlas_numero(k.item -> 'rota' ->> 'km_total') as rota_km_total,
-         public.atlas_texto(k.item -> 'rota' ->> 'tempo_total') as rota_tempo_total,
-         public.atlas_texto(k.item -> 'origem' ->> 'nome')          as origem_nome,
-         public.atlas_data(k.item -> 'origem' ->> 'eta_original')   as origem_eta_original,
-         public.atlas_data(k.item -> 'origem' ->> 'eta_real')       as origem_eta_real,
-         public.atlas_data(k.item -> 'origem' ->> 'entrada')        as origem_entrada,
-         public.atlas_data(k.item -> 'origem' ->> 'saida')          as origem_saida,
-         public.atlas_data(k.item -> 'origem' ->> 'entrada_real')   as origem_entrada_real,
-         public.atlas_data(k.item -> 'origem' ->> 'saida_real')     as origem_saida_real,
-         public.atlas_texto(k.item -> 'destino' ->> 'nome')         as destino_nome,
-         public.atlas_data(k.item -> 'destino' ->> 'eta_original')  as destino_eta_original,
-         public.atlas_data(k.item -> 'destino' ->> 'eta_real')      as destino_eta_real,
-         public.atlas_data(k.item -> 'destino' ->> 'entrada')       as destino_entrada,
-         public.atlas_data(k.item -> 'destino' ->> 'saida')         as destino_saida,
-         public.atlas_data(k.item -> 'destino' ->> 'entrada_real')  as destino_entrada_real,
-         public.atlas_data(k.item -> 'destino' ->> 'saida_real')    as destino_saida_real,
-         public.atlas_data(k.item ->> 'previsao_inicio') as previsao_inicio,
-         public.atlas_data(k.item ->> 'previsao_fim')    as previsao_fim,
-         public.atlas_data(k.item ->> 'inicio_real')     as inicio_real,
-         public.atlas_lista(k.item -> 'paradas')         as paradas,
+         torre.atlas_data(k.item ->> 'data_ultima_posicao') as data_ultima_posicao,
+         torre.atlas_numero(k.item ->> 'velocidade')        as velocidade,
+         torre.atlas_texto(k.item ->> 'macro_vigente')      as macro_vigente,
+         torre.atlas_texto(k.item ->> 'cidade_uf')          as cidade_uf,
+         torre.atlas_texto(k.item ->> 'localizacao_atual')  as localizacao_atual,
+         torre.atlas_texto(k.motorista ->> 'nome')          as motorista_nome,
+         upper(torre.atlas_texto(k.motorista ->> 'vinculo')) as motorista_vinculo,
+         torre.atlas_texto(k.item -> 'rota' ->> 'codigo')    as rota_codigo,
+         torre.atlas_texto(k.item -> 'rota' ->> 'descricao') as rota_descricao,
+         torre.atlas_numero(k.item -> 'rota' ->> 'km_total') as rota_km_total,
+         torre.atlas_texto(k.item -> 'rota' ->> 'tempo_total') as rota_tempo_total,
+         torre.atlas_texto(k.item -> 'origem' ->> 'nome')          as origem_nome,
+         torre.atlas_data(k.item -> 'origem' ->> 'eta_original')   as origem_eta_original,
+         torre.atlas_data(k.item -> 'origem' ->> 'eta_real')       as origem_eta_real,
+         torre.atlas_data(k.item -> 'origem' ->> 'entrada')        as origem_entrada,
+         torre.atlas_data(k.item -> 'origem' ->> 'saida')          as origem_saida,
+         torre.atlas_data(k.item -> 'origem' ->> 'entrada_real')   as origem_entrada_real,
+         torre.atlas_data(k.item -> 'origem' ->> 'saida_real')     as origem_saida_real,
+         torre.atlas_texto(k.item -> 'destino' ->> 'nome')         as destino_nome,
+         torre.atlas_data(k.item -> 'destino' ->> 'eta_original')  as destino_eta_original,
+         torre.atlas_data(k.item -> 'destino' ->> 'eta_real')      as destino_eta_real,
+         torre.atlas_data(k.item -> 'destino' ->> 'entrada')       as destino_entrada,
+         torre.atlas_data(k.item -> 'destino' ->> 'saida')         as destino_saida,
+         torre.atlas_data(k.item -> 'destino' ->> 'entrada_real')  as destino_entrada_real,
+         torre.atlas_data(k.item -> 'destino' ->> 'saida_real')    as destino_saida_real,
+         torre.atlas_data(k.item ->> 'previsao_inicio') as previsao_inicio,
+         torre.atlas_data(k.item ->> 'previsao_fim')    as previsao_fim,
+         torre.atlas_data(k.item ->> 'inicio_real')     as inicio_real,
+         torre.atlas_lista(k.item -> 'paradas')         as paradas,
          k.item                                          as bruto
     from chaves k;
 
@@ -493,7 +535,7 @@ begin
     from pg_temp._atlas;
 
   select count(*) into v_ativos
-    from public.veiculos_atual
+    from torre.veiculos_atual
    where ativo and not (bruto ? '_exemplo');
 
   -- Trava dos 50%
@@ -507,7 +549,7 @@ begin
 
   if v_erro is null then
     -- Retrato atual
-    insert into public.veiculos_atual as va (
+    insert into torre.veiculos_atual as va (
       placa, placa_carreta, frota_cavalo, vinculo_cavalo, vinculo_carreta,
       nome_cliente, operacao, codigo_sm, status_sm, status_operacional, data_cadastro_sm,
       latitude, longitude, data_ultima_posicao, velocidade, macro_vigente, cidade_uf, localizacao_atual,
@@ -575,26 +617,26 @@ begin
     get diagnostics v_gravados = row_count;
 
     -- Quem não veio fica inativo (não apaga).
-    update public.veiculos_atual va
+    update torre.veiculos_atual va
        set ativo = false
      where va.ativo
        and not exists (select 1 from pg_temp._atlas a where a.ordem = 1 and a.placa = va.placa);
     get diagnostics v_desativados = row_count;
 
     -- Paradas: substitui tudo.
-    delete from public.paradas_atual where true;
-    insert into public.paradas_atual (placa, codigo_sm, sequencia, nome,
+    delete from torre.paradas_atual where true;
+    insert into torre.paradas_atual (placa, codigo_sm, sequencia, nome,
                                       eta_original, eta_real, entrada, saida, entrada_real, saida_real)
     select a.placa,
            a.codigo_sm,
-           coalesce(public.atlas_numero(p.v ->> 'sequencia')::integer, p.i::integer),
-           public.atlas_texto(p.v ->> 'nome'),
-           public.atlas_data(p.v ->> 'eta_original'),
-           public.atlas_data(p.v ->> 'eta_real'),
-           public.atlas_data(p.v ->> 'entrada'),
-           public.atlas_data(p.v ->> 'saida'),
-           public.atlas_data(p.v ->> 'entrada_real'),
-           public.atlas_data(p.v ->> 'saida_real')
+           coalesce(torre.atlas_numero(p.v ->> 'sequencia')::integer, p.i::integer),
+           torre.atlas_texto(p.v ->> 'nome'),
+           torre.atlas_data(p.v ->> 'eta_original'),
+           torre.atlas_data(p.v ->> 'eta_real'),
+           torre.atlas_data(p.v ->> 'entrada'),
+           torre.atlas_data(p.v ->> 'saida'),
+           torre.atlas_data(p.v ->> 'entrada_real'),
+           torre.atlas_data(p.v ->> 'saida_real')
       from pg_temp._atlas a
      cross join lateral jsonb_array_elements(a.paradas) with ordinality as p(v, i)
      where a.ordem = 1
@@ -602,7 +644,7 @@ begin
     get diagnostics v_paradas = row_count;
 
     -- Histórico: só entra posição nova (mesma placa + mesma data_posicao = ignorada).
-    insert into public.posicoes (placa, latitude, longitude, velocidade, macro, data_posicao)
+    insert into torre.posicoes (placa, latitude, longitude, velocidade, macro, data_posicao)
     select a.placa, a.latitude, a.longitude, a.velocidade, a.macro_vigente, a.data_ultima_posicao
       from pg_temp._atlas a
      where a.ordem = 1
@@ -623,7 +665,7 @@ begin
     'paradas', v_paradas,
     'posicoes_novas', v_posicoes);
 
-  insert into public.sincronizacao (fonte, iniciado_em, terminado_em, http_status,
+  insert into torre.sincronizacao (fonte, iniciado_em, terminado_em, http_status,
                                     recebidos, gravados, sem_placa, erro, detalhes)
   values ('atlas', coalesce(p_iniciado_em, v_agora), clock_timestamp(), p_http_status,
           v_recebidos, v_gravados, v_sem_placa, v_erro, v_detalhes);
@@ -641,7 +683,7 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 6. RPC registrar_falha_atlas: HTTP diferente de 200, JSON inválido, timeout
 -- -----------------------------------------------------------------------------
-create or replace function public.registrar_falha_atlas(
+create or replace function torre.registrar_falha_atlas(
   p_http_status  integer,
   p_erro         text,
   p_iniciado_em  timestamptz default null
@@ -651,7 +693,7 @@ language sql
 security definer
 set search_path = ''
 as $$
-  insert into public.sincronizacao (fonte, iniciado_em, terminado_em, http_status, recebidos, gravados, erro)
+  insert into torre.sincronizacao (fonte, iniciado_em, terminado_em, http_status, recebidos, gravados, erro)
   values ('atlas', coalesce(p_iniciado_em, now()), clock_timestamp(), p_http_status, 0, 0,
           left(coalesce(nullif(btrim(p_erro), ''), 'falha sem descrição'), 500))
   returning id;
@@ -661,7 +703,7 @@ $$;
 -- -----------------------------------------------------------------------------
 -- 7. Limpeza diária (agendada no passo 02)
 -- -----------------------------------------------------------------------------
-create or replace function public.limpar_historico()
+create or replace function torre.limpar_historico()
 returns jsonb
 language plpgsql
 security definer
@@ -671,12 +713,12 @@ declare
   v_posicoes integer;
   v_sinc     integer;
 begin
-  delete from public.posicoes
-   where data_posicao < now() - make_interval(days => public.parametro_int('dias_historico_posicoes', 15));
+  delete from torre.posicoes
+   where data_posicao < now() - make_interval(days => torre.parametro_int('dias_historico_posicoes', 15));
   get diagnostics v_posicoes = row_count;
 
-  delete from public.sincronizacao
-   where iniciado_em < now() - make_interval(days => public.parametro_int('dias_historico_sincronizacao', 90));
+  delete from torre.sincronizacao
+   where iniciado_em < now() - make_interval(days => torre.parametro_int('dias_historico_sincronizacao', 90));
   get diagnostics v_sinc = row_count;
 
   return jsonb_build_object('posicoes_apagadas', v_posicoes, 'sincronizacoes_apagadas', v_sinc);
@@ -691,7 +733,7 @@ $$;
 --   tem placa e destino_eta_real          -> mostra o ETA
 --   tem placa, sem ETA, com SM válida     -> 'Erro API Atlas'
 --   tem placa, sem ETA, sem SM (vazio/0)  -> 'Sem SM'
-create or replace view public.v_painel
+create or replace view torre.v_painel
 with (security_invoker = true)
 as
 select v.placa,
@@ -743,85 +785,71 @@ select v.placa,
        coalesce(v.velocidade = 0, false)                   as parado,
        coalesce(v.velocidade > 0, false)                   as em_movimento,
        v.visto_em
-  from public.veiculos_atual v
- cross join (select public.parametro_int('minutos_posicao_atrasada', 30) as minutos_atraso) cfg
+  from torre.veiculos_atual v
+ cross join (select torre.parametro_int('minutos_posicao_atrasada', 30) as minutos_atraso) cfg
  where v.ativo;
 
 
 -- -----------------------------------------------------------------------------
 -- 9. Permissões
 -- -----------------------------------------------------------------------------
--- O Supabase dá, por padrão, acesso total às tabelas novas para anon e
--- authenticated. Aqui tiramos tudo e devolvemos só leitura para quem está logado;
--- o RLS ainda filtra: só operador ativo vê alguma linha.
+-- Tudo aqui é só no schema torre. Primeiro tira qualquer acesso de anon e
+-- authenticated (de tudo o que existe no torre) e depois devolve só leitura para
+-- quem está logado; o RLS ainda filtra: só admin do site ou operador ativo vê
+-- alguma linha.
 
-revoke all on public.parametros, public.veiculos_atual, public.paradas_atual, public.posicoes,
-              public.sincronizacao, public.operadores, public.v_painel
-  from public, anon, authenticated;
+revoke all on all tables    in schema torre from public, anon, authenticated;
+revoke all on all sequences in schema torre from public, anon, authenticated;
+revoke all on all functions in schema torre from public, anon, authenticated;
 
-grant select on public.parametros, public.veiculos_atual, public.paradas_atual, public.posicoes,
-                public.sincronizacao, public.operadores, public.v_painel
+grant select on torre.parametros, torre.veiculos_atual, torre.paradas_atual, torre.posicoes,
+                torre.sincronizacao, torre.operadores, torre.v_painel
   to authenticated;
 
-grant all on public.parametros, public.veiculos_atual, public.paradas_atual, public.posicoes,
-             public.sincronizacao, public.operadores, public.v_painel
-  to service_role;
-
--- Funções: nenhuma fica aberta ao público.
-revoke all on function public.parametro_int(text, integer)             from public, anon, authenticated;
-revoke all on function public.atlas_data(text)                         from public, anon, authenticated;
-revoke all on function public.atlas_numero(text)                       from public, anon, authenticated;
-revoke all on function public.atlas_texto(text)                        from public, anon, authenticated;
-revoke all on function public.atlas_sm(text)                           from public, anon, authenticated;
-revoke all on function public.atlas_placa(text)                        from public, anon, authenticated;
-revoke all on function public.atlas_lista(jsonb)                       from public, anon, authenticated;
-revoke all on function public.atlas_sem_cpf(jsonb)                     from public, anon, authenticated;
-revoke all on function public.aplicar_atlas(jsonb, integer, timestamptz)        from public, anon, authenticated;
-revoke all on function public.registrar_falha_atlas(integer, text, timestamptz) from public, anon, authenticated;
-revoke all on function public.limpar_historico()                       from public, anon, authenticated;
-revoke all on function public.eh_operador()                            from public, anon, authenticated;
+grant all on all tables    in schema torre to service_role;
+grant all on all sequences in schema torre to service_role;
 
 -- A view usa parametro_int() com as permissões de quem consulta.
-grant execute on function public.parametro_int(text, integer) to authenticated, service_role;
-grant execute on function public.eh_operador() to authenticated, service_role;
-grant execute on function public.aplicar_atlas(jsonb, integer, timestamptz)        to service_role;
-grant execute on function public.registrar_falha_atlas(integer, text, timestamptz) to service_role;
-grant execute on function public.limpar_historico()                                to service_role;
+grant execute on function torre.parametro_int(text, integer) to authenticated, service_role;
+grant execute on function torre.eh_operador() to authenticated, service_role;
+grant execute on function torre.aplicar_atlas(jsonb, integer, timestamptz)        to service_role;
+grant execute on function torre.registrar_falha_atlas(integer, text, timestamptz) to service_role;
+grant execute on function torre.limpar_historico()                                to service_role;
 
 
 -- -----------------------------------------------------------------------------
--- 10. RLS: leitura só para operador; nenhuma escrita pela API
+-- 10. RLS: leitura só para admin do site ou operador; nenhuma escrita pela API
 -- -----------------------------------------------------------------------------
-alter table public.parametros     enable row level security;
-alter table public.veiculos_atual enable row level security;
-alter table public.paradas_atual  enable row level security;
-alter table public.posicoes       enable row level security;
-alter table public.sincronizacao  enable row level security;
-alter table public.operadores     enable row level security;
+alter table torre.parametros     enable row level security;
+alter table torre.veiculos_atual enable row level security;
+alter table torre.paradas_atual  enable row level security;
+alter table torre.posicoes       enable row level security;
+alter table torre.sincronizacao  enable row level security;
+alter table torre.operadores     enable row level security;
 
-drop policy if exists parametros_ler_operador on public.parametros;
-create policy parametros_ler_operador on public.parametros
-  for select to authenticated using ((select public.eh_operador()));
+drop policy if exists parametros_ler_operador on torre.parametros;
+create policy parametros_ler_operador on torre.parametros
+  for select to authenticated using ((select torre.eh_operador()));
 
-drop policy if exists veiculos_ler_operador on public.veiculos_atual;
-create policy veiculos_ler_operador on public.veiculos_atual
-  for select to authenticated using ((select public.eh_operador()));
+drop policy if exists veiculos_ler_operador on torre.veiculos_atual;
+create policy veiculos_ler_operador on torre.veiculos_atual
+  for select to authenticated using ((select torre.eh_operador()));
 
-drop policy if exists paradas_ler_operador on public.paradas_atual;
-create policy paradas_ler_operador on public.paradas_atual
-  for select to authenticated using ((select public.eh_operador()));
+drop policy if exists paradas_ler_operador on torre.paradas_atual;
+create policy paradas_ler_operador on torre.paradas_atual
+  for select to authenticated using ((select torre.eh_operador()));
 
-drop policy if exists posicoes_ler_operador on public.posicoes;
-create policy posicoes_ler_operador on public.posicoes
-  for select to authenticated using ((select public.eh_operador()));
+drop policy if exists posicoes_ler_operador on torre.posicoes;
+create policy posicoes_ler_operador on torre.posicoes
+  for select to authenticated using ((select torre.eh_operador()));
 
-drop policy if exists sincronizacao_ler_operador on public.sincronizacao;
-create policy sincronizacao_ler_operador on public.sincronizacao
-  for select to authenticated using ((select public.eh_operador()));
+drop policy if exists sincronizacao_ler_operador on torre.sincronizacao;
+create policy sincronizacao_ler_operador on torre.sincronizacao
+  for select to authenticated using ((select torre.eh_operador()));
 
 -- Cada pessoa só enxerga a própria linha (o painel usa para saber nome/papel).
-drop policy if exists operadores_ler_propria on public.operadores;
-create policy operadores_ler_propria on public.operadores
+drop policy if exists operadores_ler_propria on torre.operadores;
+create policy operadores_ler_propria on torre.operadores
   for select to authenticated using (user_id = (select auth.uid()));
 
 -- Sem políticas de insert/update/delete: pela API ninguém grava.

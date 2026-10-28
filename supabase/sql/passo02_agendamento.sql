@@ -1,11 +1,16 @@
 -- =============================================================================
 -- Torre de Controle Shopee - Passo 02: agendamento (pg_cron + pg_net + Vault)
 -- =============================================================================
--- Rodar no SQL Editor DEPOIS do passo 01, de publicar a função sincronizar-atlas
--- e de cadastrar os 2 segredos no Vault (seção 0 abaixo).
+-- Rodar no SQL Editor do Supabase DO SITE, DEPOIS do passo 01, de publicar a
+-- função sincronizar-atlas e de cadastrar os 2 segredos no Vault (seção 0 abaixo).
 --
--- A URL da função e o CRON_SECRET NÃO ficam escritos aqui: são lidos do Vault
--- na hora de cada chamada. Trocar de projeto/conta = só recadastrar o Vault.
+-- Banco do site em produção: a função fica no schema torre, os jobs do pg_cron
+-- se chamam "torre-..." e os segredos do Vault "torre_...". Nada aqui mexe nos
+-- jobs do site (ex.: limpar-recusados-lgpd), nos secrets do site (CRON_SECRET,
+-- ALLOWED_ORIGINS) nem nas extensões já ativas (só "create ... if not exists").
+--
+-- A URL da função e o TORRE_CRON_SECRET NÃO ficam escritos aqui: são lidos do
+-- Vault na hora de cada chamada.
 -- =============================================================================
 
 
@@ -16,9 +21,9 @@
 -- histórico do SQL Editor depois. Nunca commite os valores.
 --
 --   select vault.create_secret('<URL da função, ex.: https://<ref>.supabase.co/functions/v1/sincronizar-atlas>',
---                              'torre_url_sincronizar_atlas', 'URL da função sincronizar-atlas');
---   select vault.create_secret('<o mesmo valor do secret CRON_SECRET da função>',
---                              'torre_cron_secret', 'Cabeçalho x-cron-secret da função sincronizar-atlas');
+--                              'torre_url_sincronizar_atlas', 'Torre: URL da função sincronizar-atlas');
+--   select vault.create_secret('<o mesmo valor do secret TORRE_CRON_SECRET da função>',
+--                              'torre_cron_secret', 'Torre: cabeçalho x-cron-secret da função sincronizar-atlas');
 --
 -- Para trocar um valor depois:
 --   select vault.update_secret((select id from vault.secrets where name = 'torre_cron_secret'), '<novo valor>');
@@ -30,6 +35,8 @@
 -- -----------------------------------------------------------------------------
 -- 1. Extensões
 -- -----------------------------------------------------------------------------
+-- O site já usa o pg_cron (e talvez o pg_net). "if not exists" não mexe em
+-- extensão já ativa; nunca há drop.
 create extension if not exists pg_cron with schema pg_catalog;
 create extension if not exists pg_net with schema extensions;
 
@@ -37,7 +44,7 @@ create extension if not exists pg_net with schema extensions;
 -- -----------------------------------------------------------------------------
 -- 2. Função que dispara a sincronização (lê URL e segredo do Vault)
 -- -----------------------------------------------------------------------------
-create or replace function public.disparar_sincronizacao_atlas()
+create or replace function torre.disparar_sincronizacao_atlas()
 returns bigint
 language plpgsql
 security definer
@@ -68,7 +75,7 @@ begin
 end;
 $$;
 
-revoke all on function public.disparar_sincronizacao_atlas() from public, anon, authenticated;
+revoke all on function torre.disparar_sincronizacao_atlas() from public, anon, authenticated;
 
 
 -- -----------------------------------------------------------------------------
@@ -81,14 +88,14 @@ revoke all on function public.disparar_sincronizacao_atlas() from public, anon, 
 select cron.schedule(
   'torre-sincronizar-atlas',
   '*/15 * * * *',
-  'select public.disparar_sincronizacao_atlas()'
+  'select torre.disparar_sincronizacao_atlas()'
 );
 
 -- Limpeza do histórico 1x por dia, às 06:17 UTC (03:17 em Brasília).
 select cron.schedule(
   'torre-limpar-historico',
   '17 6 * * *',
-  'select public.limpar_historico()'
+  'select torre.limpar_historico()'
 );
 
 
@@ -102,14 +109,15 @@ select cron.schedule(
 --     from cron.job_run_details
 --    where jobid in (select jobid from cron.job where jobname like 'torre-%')
 --    order by start_time desc limit 10;
--- Respostas HTTP da função (guardadas pelo pg_net por ~6 horas):
+-- Respostas HTTP da função (guardadas pelo pg_net por ~6 horas; se o site também
+-- usar o pg_net, as chamadas dele aparecem juntas: compare pelo horário):
 --   select id, status_code, left(content::text, 300) as resposta, created
 --     from net._http_response order by created desc limit 10;
 -- Últimas sincronizações gravadas:
 --   select id, iniciado_em, http_status, recebidos, gravados, sem_placa, erro
---     from public.sincronizacao order by id desc limit 10;
+--     from torre.sincronizacao order by id desc limit 10;
 -- Disparar uma sincronização agora, sem esperar o cron:
---   select public.disparar_sincronizacao_atlas();
+--   select torre.disparar_sincronizacao_atlas();
 
 
 -- -----------------------------------------------------------------------------
@@ -121,5 +129,6 @@ select cron.schedule(
 --   select cron.alter_job((select jobid from cron.job where jobname = 'torre-sincronizar-atlas'), active := true);
 -- Trocar o intervalo sem recriar:
 --   select cron.alter_job((select jobid from cron.job where jobname = 'torre-sincronizar-atlas'), schedule := '*/10 * * * *');
--- Remover de vez:
+-- Remover de vez (só os jobs da Torre; nunca mexa em outros, ex.: limpar-recusados-lgpd):
 --   select cron.unschedule('torre-sincronizar-atlas');
+--   select cron.unschedule('torre-limpar-historico');

@@ -20,10 +20,17 @@ const SUPABASE = 'https://teste-local.supabase.co';
 const REDE = process.env.TORRE_TESTE_REDE === '1';
 const CAPTURAS = path.join(RAIZ, 'testes', 'capturas');
 
+// operador: cadastrado em torre.operadores; admin: só a claim de admin do site
+// (app_metadata.role); motorista: conta do site sem acesso (e com "role": "admin"
+// no user_metadata, que não pode valer).
 const USUARIOS = {
   'operador@exemplo.invalid': { id: '00000000-0000-4000-8000-0000000000a1', senha: 'senha-teste', operador: { nome: 'Operador Teste', papel: 'operador', ativo: true } },
-  'semacesso@exemplo.invalid': { id: '00000000-0000-4000-8000-0000000000b2', senha: 'senha-teste', operador: null },
+  'admin@exemplo.invalid': { id: '00000000-0000-4000-8000-0000000000c3', senha: 'senha-teste', operador: null, app_metadata: { role: 'admin' }, user_metadata: { nome: 'Admin do Site' } },
+  '00000000000@motorista.exemplo.invalid': { id: '00000000-0000-4000-8000-0000000000b2', senha: 'senha-teste', operador: null, app_metadata: { provider: 'email' }, user_metadata: { role: 'admin' } },
 };
+
+// mesma regra da torre.eh_operador(): admin/diretoria do site ou operador ativo
+const temAcesso = (u) => !!u && (['admin', 'diretoria'].includes(u.app_metadata?.role) || u.operador?.ativo === true);
 
 const CDN = {
   'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js': 'node_modules/@supabase/supabase-js/dist/umd/supabase.js',
@@ -45,8 +52,8 @@ before(async () => {
   // Linhas da v_painel a partir dos dados de exemplo (como o PostgREST devolve)
   const db = await criarBanco();
   await db.exec(await lerArquivo('supabase/sql/dados_exemplo.sql'));
-  linhasPainel = (await db.query(`select coalesce(json_agg(v), '[]') as l from public.v_painel v`)).rows[0].l;
-  parametros = (await db.query(`select coalesce(json_agg(p), '[]') as l from public.parametros p`)).rows[0].l;
+  linhasPainel = (await db.query(`select coalesce(json_agg(v), '[]') as l from torre.v_painel v`)).rows[0].l;
+  parametros = (await db.query(`select coalesce(json_agg(p), '[]') as l from torre.parametros p`)).rows[0].l;
   // texto malicioso num nome para provar o escapeHtml
   linhasPainel.find((l) => l.placa === 'TSTE002').motorista_nome = '<img src=x onerror="window.__xss=1">Motorista Exemplo 02';
 
@@ -78,20 +85,23 @@ after(async () => {
 function jwt(usuario) {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
   return [b64({ alg: 'HS256', typ: 'JWT' }),
-    b64({ sub: usuario.id, aud: 'authenticated', role: 'authenticated', email: usuario.email, exp: Math.floor(Date.now() / 1000) + 3600 }),
+    b64({ sub: usuario.id, aud: 'authenticated', role: 'authenticated', email: usuario.email,
+          app_metadata: usuario.app_metadata || {}, user_metadata: usuario.user_metadata || {},
+          exp: Math.floor(Date.now() / 1000) + 3600 }),
     'assinatura-de-teste'].join('.');
 }
 
 function usuarioPublico(u) {
-  return { id: u.id, aud: 'authenticated', role: 'authenticated', email: u.email, app_metadata: {}, user_metadata: {}, created_at: '2026-01-01T00:00:00Z' };
+  return { id: u.id, aud: 'authenticated', role: 'authenticated', email: u.email,
+           app_metadata: u.app_metadata || {}, user_metadata: u.user_metadata || {}, created_at: '2026-01-01T00:00:00Z' };
 }
 
-async function novaPagina({ largura, altura, sincronizacaoMin = 5, intervaloRapido = false }) {
+async function novaPagina({ largura, altura, sincronizacaoMin = 5, intervaloRapido = false, schemaExposto = true }) {
   const contexto = await navegador.createBrowserContext();
   const pagina = await contexto.newPage();
   pagina.on('close', () => contexto.close().catch(() => {}));
   await pagina.setViewport({ width: largura, height: altura });
-  const registro = { painel: 0, erros: [] };
+  const registro = { painel: 0, erros: [], logouts: [], rest: [] };
   pagina.on('pageerror', (e) => registro.erros.push(e.message));
 
   await pagina.evaluateOnNewDocument((config, rapido) => {
@@ -145,22 +155,36 @@ async function novaPagina({ largura, altura, sincronizacaoMin = 5, intervaloRapi
         });
       }
       if (u.pathname === '/auth/v1/user') return logado ? responder(200, usuarioPublico(logado)) : responder(401, { msg: 'sem sessão' });
-      if (u.pathname === '/auth/v1/logout') return responder(204, '');
+      if (u.pathname === '/auth/v1/logout') {
+        registro.logouts.push(u.searchParams.get('scope'));
+        return responder(204, '');
+      }
 
-      // REST: sem token de usuário, o RLS não devolveria nada
+      // REST: como o PostgREST, o schema vem do Accept-Profile (GET) ou
+      // Content-Profile (POST). Sem "torre", procuraria no public e não acharia.
+      if (u.pathname.startsWith('/rest/v1/')) {
+        const perfil = req.method() === 'GET' ? req.headers()['accept-profile'] : req.headers()['content-profile'];
+        registro.rest.push({ caminho: u.pathname, perfil });
+        if (!schemaExposto) return responder(406, { code: 'PGRST106', message: 'The schema must be one of the following: public' });
+        if (perfil !== 'torre') return responder(404, { code: 'PGRST205', message: 'não existe no schema public: ' + u.pathname });
+      }
+
+      // RLS simulado: sem acesso (ou sem login) não vem linha nenhuma
+      const acesso = temAcesso(logado);
+      if (u.pathname === '/rest/v1/rpc/eh_operador') return responder(200, acesso);
       if (u.pathname === '/rest/v1/operadores') {
         const linha = logado?.operador ? [logado.operador] : [];
         return responder(200, linha);
       }
       if (u.pathname === '/rest/v1/v_painel') {
         registro.painel++;
-        return responder(200, logado?.operador ? linhasPainel : []);
+        return responder(200, acesso ? linhasPainel : []);
       }
       if (u.pathname === '/rest/v1/sincronizacao') {
         const t = new Date(Date.now() - sincronizacaoMin * 60000).toISOString();
-        return responder(200, logado?.operador ? [{ terminado_em: t, erro: null }] : []);
+        return responder(200, acesso ? [{ terminado_em: t, erro: null }] : []);
       }
-      if (u.pathname === '/rest/v1/parametros') return responder(200, logado?.operador ? parametros : []);
+      if (u.pathname === '/rest/v1/parametros') return responder(200, acesso ? parametros : []);
       return responder(404, { message: 'rota não simulada: ' + u.pathname });
     } catch (e) {
       registro.erros.push('interceptação: ' + e.message);
@@ -222,19 +246,47 @@ test('login obrigatório: sem sessão o painel volta para o login', async () => 
   await pagina.close();
 });
 
-test('login: senha errada e usuário sem cadastro de operador não entram', async () => {
-  const { pagina } = await novaPagina({ largura: 1366, altura: 768 });
+test('login: senha errada e motorista do site (sem acesso) não entram; sai só deste navegador', async () => {
+  const { pagina, registro } = await novaPagina({ largura: 1366, altura: 768 });
   await entrar(pagina, 'operador@exemplo.invalid', 'errada');
   await pagina.waitForSelector('#login-mensagem:not([hidden])');
   assert.match(await pagina.$eval('#login-mensagem', (e) => e.textContent), /incorretos/);
 
   await pagina.reload({ waitUntil: 'domcontentloaded' });
-  await entrar(pagina, 'semacesso@exemplo.invalid');
-  await pagina.waitForFunction(() => /não tem acesso/.test(document.querySelector('#login-mensagem').textContent));
-  assert.ok(pagina.url().endsWith('/HTML/login.html'));
+  await entrar(pagina, '00000000000@motorista.exemplo.invalid');
+  await pagina.waitForFunction(() => document.querySelector('#login-mensagem').textContent === 'Sem acesso à Torre de Controle.');
+  assert.ok(pagina.url().endsWith('/HTML/login.html'), 'não redireciona para o site');
+  // logout local: a sessão do motorista no site (outros aparelhos) não cai
+  assert.deepEqual(registro.logouts, ['local']);
   // e não ficou sessão salva: abrir o painel volta para o login
   await pagina.goto(`${base}/HTML/index.html`, { waitUntil: 'domcontentloaded' });
   await pagina.waitForFunction(() => location.pathname.endsWith('/HTML/login.html'), { timeout: 10000 });
+  await pagina.close();
+});
+
+test('admin do site (sem cadastro em torre.operadores) entra com o e-mail e senha do site', async () => {
+  const { pagina, registro } = await novaPagina({ largura: 1366, altura: 768 });
+  await entrar(pagina, 'admin@exemplo.invalid');
+  await esperarPainel(pagina);
+  assert.equal(await pagina.$eval('#usuario-nome', (e) => e.textContent), 'Admin do Site');
+  assert.equal(await linhasTabela(pagina), 29);
+  // todas as consultas foram ao schema torre
+  assert.ok(registro.rest.length >= 4);
+  assert.deepEqual([...new Set(registro.rest.map((r) => r.perfil))], ['torre']);
+  assert.ok(registro.rest.some((r) => r.caminho === '/rest/v1/rpc/eh_operador'));
+
+  await pagina.click('#btn-sair');
+  await pagina.waitForFunction(() => location.pathname.endsWith('/HTML/login.html') && location.search === '?motivo=saiu');
+  assert.deepEqual(registro.logouts, ['local']);
+  assert.deepEqual(registro.erros, []);
+  await pagina.close();
+});
+
+test('schema torre fora de Exposed schemas: login explica o que falta', async () => {
+  const { pagina } = await novaPagina({ largura: 1366, altura: 768, schemaExposto: false });
+  await entrar(pagina, 'admin@exemplo.invalid');
+  await pagina.waitForFunction(() => /Exposed schemas/.test(document.querySelector('#login-mensagem').textContent));
+  assert.ok(pagina.url().endsWith('/HTML/login.html'));
   await pagina.close();
 });
 
@@ -318,6 +370,8 @@ for (const [largura, altura] of [[1366, 768], [1920, 1080], [390, 844]]) {
     assert.equal(await pagina.$eval('.kpi[data-valor="FROTA"]', (b) => b.getAttribute('aria-pressed')), 'true');
     await pagina.click('#btn-limpar');
     assert.equal(await linhasTabela(pagina), 29);
+    // fim da animação do enquadramento inicial (um clique no meio dela é ignorado pelo markercluster)
+    await new Promise((r) => setTimeout(r, 800));
 
     // Clicar na tabela centraliza no mapa e abre o popup
     await pagina.click('#tabela-corpo tr[data-placa="TSTE017"]');

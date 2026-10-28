@@ -4,7 +4,7 @@
  * Painel: KPIs, mapa (Leaflet + markercluster), tabela e filtros
  * ==========================================================================
  *
- * Lê a view v_painel (o RLS só libera para operador ativo).
+ * Lê a view torre.v_painel (o RLS só libera para admin do site ou operador ativo).
  * Tudo que vem do banco passa por escapeHtml antes de ir para o HTML.
  */
 
@@ -207,10 +207,10 @@
         estado.carregando = true;
         try {
             const consultas = [
-                sb.from('v_painel').select('*').limit(5000),
-                sb.from('sincronizacao').select('terminado_em, erro').order('id', { ascending: false }).limit(20)
+                sb.schema('torre').from('v_painel').select('*').limit(5000),
+                sb.schema('torre').from('sincronizacao').select('terminado_em, erro').order('id', { ascending: false }).limit(20)
             ];
-            if (estado.primeiraCarga) consultas.push(sb.from('parametros').select('chave, valor'));
+            if (estado.primeiraCarga) consultas.push(sb.schema('torre').from('parametros').select('chave, valor'));
             const r = await Promise.all(consultas);
 
             if (r[0].error) throw r[0].error;
@@ -675,7 +675,7 @@
         });
 
         $('btn-sair').addEventListener('click', async function () {
-            try { await sb.auth.signOut(); } catch (e) { /* segue para o login */ }
+            await app.sair();
             window.location.replace('login.html?motivo=saiu');
         });
 
