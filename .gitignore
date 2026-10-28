@@ -1,0 +1,7 @@
+.env
+node_modules/
+*.csv
+*.xlsx
+*.xls
+supabase/.temp/
+testes/capturas/

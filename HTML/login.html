@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Entrar | Torre de Controle Shopee</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+    <link rel="stylesheet" href="../CSS/style.css">
+</head>
+<body class="pagina-login">
+
+    <main class="login-caixa">
+        <div class="marca marca-login">
+            <span class="marca-icone" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
+            </span>
+            <div>
+                <strong>Torre de Controle</strong>
+                <span>Shopee · AJBorges</span>
+            </div>
+        </div>
+
+        <h1 class="login-titulo">Entrar no painel</h1>
+
+        <form id="form-login" class="login-form" novalidate>
+            <label for="email">E-mail</label>
+            <input type="email" id="email" name="email" autocomplete="username" required>
+
+            <label for="senha">Senha</label>
+            <input type="password" id="senha" name="senha" autocomplete="current-password" required>
+
+            <p id="login-mensagem" class="login-mensagem" role="alert" hidden></p>
+
+            <button type="submit" id="btn-entrar" class="btn btn-primario btn-largo">Entrar</button>
+        </form>
+
+        <p class="login-rodape">Acesso restrito à equipe de operação. Sem cadastro aberto: peça acesso à gestão.</p>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"
+            integrity="sha384-BWcjm9OdFth9TbhCxZPdm+gAOUMAzQy9nmTs12ioXdCcbVnJaPMn+fMUoQCLt60R"
+            crossorigin="anonymous"></script>
+    <script src="../JavaScript/supabase-client.js"></script>
+    <script src="../JavaScript/login.js"></script>
+</body>
+</html>

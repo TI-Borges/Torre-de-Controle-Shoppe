@@ -1,0 +1,19 @@
+{
+  "name": "torre-de-controle-shopee",
+  "private": true,
+  "description": "Torre de Controle Shopee: testes locais (SQL no PGlite, função com fetch simulado e painel com puppeteer).",
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"testes/*.test.mjs\"",
+    "test:sql": "node --test testes/sql.test.mjs",
+    "test:funcao": "node --test testes/funcao.test.mjs",
+    "test:painel": "node --test testes/painel.test.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "@supabase/supabase-js": "2.117.3",
+    "leaflet": "1.9.4",
+    "leaflet.markercluster": "1.5.3",
+    "puppeteer": "25.12.0"
+  }
+}
